@@ -36,7 +36,12 @@ for (const file of fs.readdirSync(commandsDir).filter((f) => f.endsWith('.js')))
 console.log(`Loaded ${commands.size} command(s): ${[...commands.keys()].join(', ')}`);
 
 function getText(msg) {
-  const m = msg.message;
+  // Unwrap disappearing-message and view-once wrappers
+  const m =
+    msg.message?.ephemeralMessage?.message ||
+    msg.message?.viewOnceMessage?.message ||
+    msg.message?.documentWithCaptionMessage?.message ||
+    msg.message;
   if (!m) return '';
   return (
     m.conversation ||
@@ -138,22 +143,25 @@ async function startBot() {
   });
 
   s.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-
     for (const msg of messages) {
       try {
-        if (!msg.message || msg.key.fromMe) continue;
+        if (!msg.message) continue;
         const from = msg.key.remoteJid;
         if (!from || from === 'status@broadcast') continue;
+
+        // Live messages, plus recent ones sent from the owner's own phone
+        const age = Date.now() / 1000 - Number(msg.messageTimestamp || 0);
+        if (type !== 'notify' && age > 30) continue;
 
         const isGroup = from.endsWith('@g.us');
         const sender = isGroup
           ? msg.key.participantAlt || msg.key.participant
           : msg.key.remoteJidAlt || from;
 
-        saveUser(sender, msg.pushName || null);
+        if (!msg.key.fromMe) saveUser(sender, msg.pushName || null);
 
         const body = getText(msg).trim();
+        if (body) console.log(`[msg] ${msg.key.fromMe ? 'me' : 'them'} ${from}: ${body.slice(0, 60)}`);
         if (!body.startsWith(config.prefix)) continue;
 
         const [name, ...args] = body.slice(config.prefix.length).split(/\s+/);
