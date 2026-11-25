@@ -1,4 +1,5 @@
 import { withDownload, updateEngine } from '../lib/ytdlp.js';
+import { giftedAvailable, withGiftedFile } from '../lib/gifted.js';
 
 const URL_RE = /https?:\/\/[^\s]+/i;
 
@@ -35,14 +36,82 @@ async function deliver({ sock, from, msg }, item) {
   }
 }
 
-async function handle(ctx, target, mode, icon) {
-  await ctx.reply(`⏳ ${icon} Downloading... this can take a minute.`);
+// Title of a YouTube link, without downloading it (used to find it on SoundCloud)
+async function youtubeTitle(url) {
+  try {
+    const res = await fetch(`https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(url)}`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return [data.title, data.author_name].filter(Boolean).join(' ') || null;
+  } catch {
+    return null;
+  }
+}
+
+const isYouTube = (u) => /(youtube\.com|youtu\.be)/i.test(u || '');
+const NOT_FOUND =
+  'I could not find that song on SoundCloud. Try the artist and the title, for example: !play burna boy last last';
+
+// Optional backup service for YouTube (only runs when GIFTED_FALLBACK=1)
+async function tryBackup(ctx, input, mode) {
+  if (!(await giftedAvailable())) return false;
+  await ctx.reply('⚠️ YouTube blocked me, trying a backup service...');
+  try {
+    await withGiftedFile(input, mode, (item) => deliver(ctx, item));
+    return true;
+  } catch (err) {
+    console.error('[gifted] failed:', err.message);
+    return false;
+  }
+}
+
+/**
+ * fallback (audio only): a search text, or a function returning one.
+ * If YouTube blocks the server, the bot looks the song up on SoundCloud instead.
+ * opts.search: the target is a SoundCloud search, so give a "not found" message.
+ */
+async function handle(ctx, target, mode, icon, fallback, opts = {}) {
+  await ctx.reply(`⏳ ${icon} ${opts.search ? 'Searching SoundCloud...' : 'Downloading... this can take a minute.'}`);
   try {
     await withDownload(target, mode, (item) => deliver(ctx, item));
   } catch (err) {
+    if (err.blocked && opts.youtube && (await tryBackup(ctx, opts.youtube, mode))) return;
+    if (err.blocked && fallback && mode === 'audio') {
+      const query = typeof fallback === 'function' ? await fallback() : fallback;
+      if (query) {
+        await ctx.reply('⚠️ YouTube blocked me, so I am searching SoundCloud instead...');
+        try {
+          await withDownload(`scsearch1:${query}`, 'audio', (item) => deliver(ctx, item));
+          return;
+        } catch (err2) {
+          if (!err2.user) console.error('SoundCloud fallback error:', err2);
+          return ctx.reply(`❌ ${err2.generic ? NOT_FOUND : err2.user ? err2.message : 'Something went wrong.'}`);
+        }
+      }
+    }
     if (!err.user) console.error('Download error:', err);
-    await ctx.reply(`❌ ${err.user ? err.message : 'Something went wrong while downloading.'}`);
+    const extra =
+      err.blocked && mode === 'video'
+        ? '\nVideo from YouTube is blocked on this server. Songs via !play still work.'
+        : '';
+    const text = err.user ? (err.generic && opts.search ? NOT_FOUND : err.message) : 'Something went wrong while downloading.';
+    await ctx.reply(`❌ ${text}${extra}`);
   }
+}
+
+// A song name goes to SoundCloud. A link goes straight to that site.
+async function audioCommand(ctx, example) {
+  const url = findUrl(ctx.args, ctx.msg);
+  const query = ctx.args.join(' ').trim();
+  if (!url && !query) return ctx.reply(`Type a song name or send a link. Example: ${example}`);
+  if (url) {
+    return handle(ctx, url, 'audio', '🎵', isYouTube(url) ? () => youtubeTitle(url) : null, {
+      youtube: isYouTube(url) ? url : null,
+    });
+  }
+  return handle(ctx, `scsearch1:${query}`, 'audio', '🎵', null, { search: true });
 }
 
 // Commands that need a link from one particular site
@@ -65,43 +134,46 @@ function siteCommand({ name, aliases = [], pattern, mode = 'video', icon, descri
 export default [
   {
     name: 'play',
-    aliases: ['song', 'music'],
+    aliases: ['song', 'music', 'p'],
     category: 'DOWNLOADER',
-    description: 'Find a song by name and send it as audio',
+    description: 'Find a song by name (SoundCloud) and send it as audio',
     async run(ctx) {
-      const url = findUrl(ctx.args, ctx.msg);
-      const query = ctx.args.join(' ').trim();
-      if (!url && !query) return ctx.reply('Type a song name. Example: !play burna boy last last');
-      await handle(ctx, url || `ytsearch1:${query}`, 'audio', '🎵');
+      await audioCommand(ctx, '!play burna boy last last');
+    },
+  },
+  {
+    name: 'soundcloud',
+    aliases: ['scloud', 'sc'],
+    category: 'DOWNLOADER',
+    description: 'Song by name or SoundCloud link, as audio',
+    async run(ctx) {
+      await audioCommand(ctx, '!soundcloud https://soundcloud.com/artist/track');
     },
   },
   {
     name: 'ytmp3',
-    aliases: ['mp3'],
+    aliases: ['mp3', 'yta'],
     category: 'DOWNLOADER',
-    description: 'YouTube link or search to MP3',
+    description: 'Link or song name to MP3',
     async run(ctx) {
-      const url = findUrl(ctx.args, ctx.msg);
-      const query = ctx.args.join(' ').trim();
-      if (!url && !query) return ctx.reply('Send a link. Example: !ytmp3 https://youtu.be/xxxx');
-      await handle(ctx, url || `ytsearch1:${query}`, 'audio', '🎵');
+      await audioCommand(ctx, '!ytmp3 https://youtu.be/xxxx');
     },
   },
   {
     name: 'ytmp4',
-    aliases: ['video', 'ytv'],
+    aliases: ['video', 'ytv', 'yt'],
     category: 'DOWNLOADER',
     description: 'YouTube link or search to video',
     async run(ctx) {
       const url = findUrl(ctx.args, ctx.msg);
       const query = ctx.args.join(' ').trim();
       if (!url && !query) return ctx.reply('Send a link. Example: !ytmp4 https://youtu.be/xxxx');
-      await handle(ctx, url || `ytsearch1:${query}`, 'video', '🎬');
+      await handle(ctx, url || `ytsearch1:${query}`, 'video', '🎬', null, { youtube: url || query });
     },
   },
   siteCommand({
     name: 'tiktok',
-    aliases: ['tt'],
+    aliases: ['tt', 'tk'],
     pattern: /tiktok\.com/i,
     icon: '🎬',
     description: 'Download a TikTok video',
@@ -109,7 +181,7 @@ export default [
   }),
   siteCommand({
     name: 'tiktokmp3',
-    aliases: ['ttmp3'],
+    aliases: ['ttmp3', 'tkmp3'],
     pattern: /tiktok\.com/i,
     mode: 'audio',
     icon: '🎵',
@@ -134,7 +206,7 @@ export default [
   }),
   siteCommand({
     name: 'pinterest',
-    aliases: ['pin'],
+    aliases: ['pin', 'pt'],
     pattern: /(pinterest\.|pin\.it)/i,
     icon: '📌',
     description: 'Download a Pinterest video or image',
@@ -142,7 +214,7 @@ export default [
   }),
   siteCommand({
     name: 'xdown',
-    aliases: ['twitter', 'x'],
+    aliases: ['twitter', 'x', 'tw'],
     pattern: /(twitter\.com|x\.com)/i,
     icon: '🐦',
     description: 'Download a video from X (Twitter)',
