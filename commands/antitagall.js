@@ -1,17 +1,21 @@
 
-module.exports = async (sock, m) => {
-  try {
-    const chat = m.key.remoteJid;
+export default {
+  name: 'antitagall',
 
-    await sock.sendMessage(
-      chat,
-      {
-        text: "✅ Anti-Tag All command is working!"
-      },
-      { quoted: m }
-    );
+  run: async ({ sock, msg, from, sender }) => {
+    try {
+      if (!from.endsWith('@g.us')) {
+        return sock.sendMessage(from, {
+          text: '❌ This command only works in groups.'
+        }, { quoted: msg });
+      }
 
-  } catch (error) {
-    console.error("Anti-Tag All Error:", error);
+      await sock.sendMessage(from, {
+        text: '✅ VIPPER-MD Anti-Tag All command is working!'
+      }, { quoted: msg });
+
+    } catch (error) {
+      console.error('Anti-Tag All Error:', error);
+    }
   }
 };
