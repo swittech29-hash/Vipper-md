@@ -1,3 +1,4 @@
+
 import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
@@ -5,7 +6,6 @@ import pino from 'pino';
 import express from 'express';
 import { fileURLToPath, pathToFileURL } from 'url';
 import * as baileysNs from '@whiskeysockets/baileys';
-
 import config from './config.js';
 import { supabase, saveUser } from './lib/db.js';
 import { useSupabaseAuthState } from './lib/supabaseAuth.js';
@@ -15,8 +15,12 @@ const baileys =
   baileysNs.default && typeof baileysNs.default === 'object'
     ? baileysNs.default
     : baileysNs;
+
 const makeWASocket =
-  typeof baileys.default === 'function' ? baileys.default : baileys.makeWASocket;
+  typeof baileys.default === 'function'
+    ? baileys.default
+    : baileys.makeWASocket;
+
 const {
   useMultiFileAuthState,
   DisconnectReason,
@@ -29,20 +33,24 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // ---------- Load commands ----------
 const commands = new Map();
 const commandsDir = path.join(__dirname, 'commands');
+
 for (const file of fs.readdirSync(commandsDir).filter((f) => f.endsWith('.js'))) {
   const mod = await import(pathToFileURL(path.join(commandsDir, file)).href);
   commands.set(mod.default.name, mod.default);
 }
+
 console.log(`Loaded ${commands.size} command(s): ${[...commands.keys()].join(', ')}`);
 
+// ---------- Get message text ----------
 function getText(msg) {
-  // Unwrap disappearing-message and view-once wrappers
   const m =
     msg.message?.ephemeralMessage?.message ||
     msg.message?.viewOnceMessage?.message ||
     msg.message?.documentWithCaptionMessage?.message ||
     msg.message;
+
   if (!m) return '';
+
   return (
     m.conversation ||
     m.extendedTextMessage?.text ||
@@ -52,12 +60,41 @@ function getText(msg) {
   );
 }
 
+// ---------- Get mentioned members ----------
+function getMentionedJids(msg) {
+  const message =
+    msg.message?.ephemeralMessage?.message ||
+    msg.message?.viewOnceMessage?.message ||
+    msg.message?.documentWithCaptionMessage?.message ||
+    msg.message;
+
+  if (!message) return [];
+
+  return [
+    ...(message.extendedTextMessage?.contextInfo?.mentionedJid || []),
+    ...(message.imageMessage?.contextInfo?.mentionedJid || []),
+    ...(message.videoMessage?.contextInfo?.mentionedJid || [])
+  ];
+}
+
+// Compare WhatsApp JIDs while ignoring device suffixes
+function normalizeJid(jid) {
+  if (!jid || typeof jid !== 'string') return '';
+  return jid.replace(/:\d+@/, '@');
+}
+
+function sameJid(a, b) {
+  return normalizeJid(a) === normalizeJid(b);
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Cache the WhatsApp version so we don't fetch it on every pair request
+// Cache the WhatsApp version
 let cachedVersion = null;
+
 async function getVersion() {
   if (cachedVersion) return cachedVersion;
+
   try {
     const { version, error } = await fetchLatestBaileysVersion();
     if (!error) cachedVersion = version;
@@ -79,7 +116,7 @@ function boot() {
 let sock = null;
 let isOnline = false;
 let canPair = false;
-let gen = 0; // each new socket gets a number; events from old sockets are ignored
+let gen = 0;
 
 async function startBot() {
   const myGen = ++gen;
@@ -87,10 +124,11 @@ async function startBot() {
   const auth = supabase
     ? await useSupabaseAuthState(baileys)
     : await useMultiFileAuthState(config.sessionDir);
+
   const { state, saveCreds } = auth;
   const version = await getVersion();
 
-  if (myGen !== gen) return; // a newer socket was requested while loading
+  if (myGen !== gen) return;
 
   canPair = false;
 
@@ -100,8 +138,9 @@ async function startBot() {
     logger: pino({ level: 'silent' }),
     browser: Browsers.ubuntu('Chrome'),
     printQRInTerminal: false,
-    qrTimeout: 120000, // keep the pairing window open longer
+    qrTimeout: 120000,
   });
+
   sock = s;
 
   s.ev.on('creds.update', saveCreds);
@@ -109,7 +148,6 @@ async function startBot() {
   s.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (myGen !== gen) return;
 
-    // A QR event means the socket is ready to be paired
     if (qr) canPair = true;
 
     if (connection === 'open') {
@@ -121,17 +159,25 @@ async function startBot() {
     if (connection === 'close') {
       isOnline = false;
       canPair = false;
+
       const code = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
-      console.log(`Connection closed (code ${code}).`, loggedOut ? 'Logged out.' : '');
+
+      console.log(
+        `Connection closed (code ${code}).`,
+        loggedOut ? 'Logged out.' : ''
+      );
 
       if (loggedOut && auth.clear) {
         await auth.clear();
         console.log('Session cleared.');
       }
 
-      // Pairing window ran out and nothing is linked: stay idle until a new pair request
-      const idle = !s.authState.creds.registered && code === DisconnectReason.timedOut && !loggedOut;
+      const idle =
+        !s.authState.creds.registered &&
+        code === DisconnectReason.timedOut &&
+        !loggedOut;
+
       if (idle) {
         console.log('Pairing window ended. Waiting for a new pair request.');
         return;
@@ -142,33 +188,126 @@ async function startBot() {
     }
   });
 
+  // ---------- Incoming messages ----------
   s.ev.on('messages.upsert', async ({ messages, type }) => {
     for (const msg of messages) {
       try {
         if (!msg.message) continue;
+
         const from = msg.key.remoteJid;
+
         if (!from || from === 'status@broadcast') continue;
 
-        // Live messages, plus recent ones sent from the owner's own phone
-        const age = Date.now() / 1000 - Number(msg.messageTimestamp || 0);
+        const age =
+          Date.now() / 1000 - Number(msg.messageTimestamp || 0);
+
         if (type !== 'notify' && age > 30) continue;
 
         const isGroup = from.endsWith('@g.us');
+
         const sender = isGroup
           ? msg.key.participantAlt || msg.key.participant
           : msg.key.remoteJidAlt || from;
 
-        if (!msg.key.fromMe) saveUser(sender, msg.pushName || null);
+        if (!msg.key.fromMe) {
+          saveUser(sender, msg.pushName || null);
+        }
+
+        // ---------- Anti-Tag All Protection ----------
+        const antiTagAll = commands.get('antitagall');
+
+        if (
+          isGroup &&
+          !msg.key.fromMe &&
+          antiTagAll?.enabledGroups?.has(from)
+        ) {
+          const mentions = getMentionedJids(msg);
+
+          // Five or more mentions triggers protection
+          if (mentions.length >= 5) {
+            try {
+              const metadata = await s.groupMetadata(from);
+
+              const offender = metadata.participants.find((p) =>
+                [p.id, p.lid, p.phoneNumber].some((id) =>
+                  sameJid(id, sender)
+                )
+              );
+
+              const offenderIsAdmin =
+                offender?.admin === 'admin' ||
+                offender?.admin === 'superadmin';
+
+              // Admins are exempt
+              if (offender && !offenderIsAdmin) {
+                const botIds = [
+                  s.user?.id,
+                  s.user?.lid
+                ].filter(Boolean);
+
+                const botParticipant = metadata.participants.find((p) =>
+                  [p.id, p.lid, p.phoneNumber].some((id) =>
+                    botIds.some((botId) => sameJid(id, botId))
+                  )
+                );
+
+                const botIsAdmin =
+                  botParticipant?.admin === 'admin' ||
+                  botParticipant?.admin === 'superadmin';
+
+                if (botIsAdmin) {
+                  await s.groupParticipantsUpdate(
+                    from,
+                    [offender.id],
+                    'remove'
+                  );
+
+                  await s.sendMessage(from, {
+                    text: '🚫 A member was removed for mass tagging.'
+                  });
+                } else {
+                  console.log(
+                    'Anti-Tag All: VIPPER-MD needs group admin permission.'
+                  );
+                }
+
+                continue;
+              }
+            } catch (error) {
+              console.error('Anti-Tag All Protection Error:', error);
+            }
+          }
+        }
+        // ---------- End Anti-Tag All Protection ----------
 
         const body = getText(msg).trim();
-        if (body) console.log(`[msg] ${msg.key.fromMe ? 'me' : 'them'} ${from}: ${body.slice(0, 60)}`);
+
+        if (body) {
+          console.log(
+            `[msg] ${msg.key.fromMe ? 'me' : 'them'} ${from}: ${body.slice(0, 60)}`
+          );
+        }
+
         if (!body.startsWith(config.prefix)) continue;
 
-        const [name, ...args] = body.slice(config.prefix.length).split(/\s+/);
+        const [name, ...args] = body
+          .slice(config.prefix.length)
+          .split(/\s+/);
+
         const cmd = commands.get(name.toLowerCase());
+
         if (!cmd) continue;
 
-        await cmd.run({ sock: s, msg, from, sender, args, commands, config });
+        await cmd.run({
+          sock: s,
+          msg,
+          from,
+          sender,
+          args,
+          commands,
+          config
+        });
+
       } catch (err) {
         console.error('Error handling message:', err);
       }
@@ -176,17 +315,19 @@ async function startBot() {
   });
 }
 
-// Start a brand new socket so the pairing code gets its full lifetime
+// ---------- Fresh socket ----------
 async function freshSocket() {
   const old = sock;
-  const p = startBot(); // bumps gen right away, so the old socket's events are ignored
+  const p = startBot();
+
   try {
     old?.end(undefined);
   } catch {}
+
   await p;
 }
 
-// ---------- Web server (needed by Render + pair link) ----------
+// ---------- Web server ----------
 const app = express();
 const PAIR_KEY = process.env.PAIR_KEY;
 let pairBusy = false;
@@ -203,7 +344,10 @@ input,button{width:100%;padding:12px;margin:6px 0;font-size:16px;box-sizing:bord
 <body><h2>${config.botName}</h2>${body}</body></html>`;
 
 app.get('/', (req, res) => {
-  const status = isOnline ? '✅ Bot is online' : '⏳ Bot is not linked or still connecting';
+  const status = isOnline
+    ? '✅ Bot is online'
+    : '⏳ Bot is not linked or still connecting';
+
   res.send(
     page(`<p>${status}</p>
 <p><b>Tip:</b> open WhatsApp first: Settings → Linked Devices → Link a Device → Link with phone number instead. Then tap the button below and enter the code quickly.</p>
@@ -217,30 +361,47 @@ app.get('/', (req, res) => {
 
 app.get('/pair', async (req, res) => {
   if (pairBusy) {
-    return res.status(429).send(page('<p>Another request is in progress. Wait a few seconds.</p><a href="/">Back</a>'));
+    return res.status(429).send(
+      page('<p>Another request is in progress. Wait a few seconds.</p><a href="/">Back</a>')
+    );
   }
+
   pairBusy = true;
+
   try {
     if (!PAIR_KEY || req.query.key !== PAIR_KEY) {
-      return res.status(403).send(page('<p>❌ Wrong pair key.</p><a href="/">Back</a>'));
+      return res.status(403).send(
+        page('<p>❌ Wrong pair key.</p><a href="/">Back</a>')
+      );
     }
+
     const number = String(req.query.number || '').replace(/\D/g, '');
+
     if (!number) {
-      return res.status(400).send(page('<p>Enter your number with country code.</p><a href="/">Back</a>'));
+      return res.status(400).send(
+        page('<p>Enter your number with country code.</p><a href="/">Back</a>')
+      );
     }
+
     if (isOnline) {
       return res.send(page('<p>✅ Already linked and online.</p>'));
     }
 
-    // Always start a fresh socket so the code is as new as possible
     await freshSocket();
-    for (let i = 0; i < 40 && !canPair; i++) await sleep(500);
+
+    for (let i = 0; i < 40 && !canPair; i++) {
+      await sleep(500);
+    }
+
     if (!canPair) {
-      return res.status(503).send(page('<p>Not ready yet. Wait 10 seconds and try again.</p><a href="/">Back</a>'));
+      return res.status(503).send(
+        page('<p>Not ready yet. Wait 10 seconds and try again.</p><a href="/">Back</a>')
+      );
     }
 
     const code = await sock.requestPairingCode(number);
     const pretty = code.match(/.{1,4}/g)?.join('-') || code;
+
     res.send(
       page(`<p>Enter this code in WhatsApp now:</p>
 <div class="code">${pretty}</div>
@@ -249,15 +410,23 @@ app.get('/pair', async (req, res) => {
 <p>WhatsApp may also show a notification. Tap it to open the code screen. Don't refresh this page, because that makes a new code and cancels this one.</p>
 <script>var s=90;setInterval(function(){s--;document.getElementById('t').textContent=s>0?('Expires in about '+s+'s'):'Expired. Go back and get a new code.';},1000);</script>`)
     );
+
   } catch (err) {
     console.error('Pair error:', err);
-    res.status(500).send(page(`<p>Could not get a code: ${err.message}</p><a href="/">Back</a>`));
+
+    res.status(500).send(
+      page(`<p>Could not get a code: ${err.message}</p><a href="/">Back</a>`)
+    );
+
   } finally {
     pairBusy = false;
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Web server on port ${PORT}`));
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Web server on port ${PORT}`);
+});
 
 boot();
