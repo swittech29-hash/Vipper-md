@@ -1,5 +1,6 @@
 export default {
   name: 'ping',
+  category: 'BOT',
   description: 'Check if the bot is alive',
   async run({ sock, msg, from }) {
     const start = Date.now();
