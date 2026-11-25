@@ -49,6 +49,27 @@ function getText(msg) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Cache the WhatsApp version so we don't fetch it on every pair request
+let cachedVersion = null;
+async function getVersion() {
+  if (cachedVersion) return cachedVersion;
+  try {
+    const { version, error } = await fetchLatestBaileysVersion();
+    if (!error) cachedVersion = version;
+    return version;
+  } catch {
+    return undefined;
+  }
+}
+
+// Start the bot and retry if startup fails
+function boot() {
+  startBot().catch((err) => {
+    console.error('Start failed, retrying in 5s:', err.message);
+    setTimeout(boot, 5000);
+  });
+}
+
 // ---------- Bot ----------
 let sock = null;
 let isOnline = false;
@@ -62,7 +83,7 @@ async function startBot() {
     ? await useSupabaseAuthState(baileys)
     : await useMultiFileAuthState(config.sessionDir);
   const { state, saveCreds } = auth;
-  const { version } = await fetchLatestBaileysVersion();
+  const version = await getVersion();
 
   if (myGen !== gen) return; // a newer socket was requested while loading
 
@@ -112,7 +133,7 @@ async function startBot() {
       }
 
       console.log('Reconnecting...');
-      startBot();
+      boot();
     }
   });
 
@@ -231,4 +252,4 @@ app.get('/pair', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Web server on port ${PORT}`));
 
-startBot();
+boot();
