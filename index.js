@@ -53,28 +53,36 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let sock = null;
 let isOnline = false;
 let canPair = false;
+let gen = 0; // each new socket gets a number; events from old sockets are ignored
 
 async function startBot() {
+  const myGen = ++gen;
+
   const auth = supabase
     ? await useSupabaseAuthState(baileys)
     : await useMultiFileAuthState(config.sessionDir);
   const { state, saveCreds } = auth;
   const { version } = await fetchLatestBaileysVersion();
 
+  if (myGen !== gen) return; // a newer socket was requested while loading
+
   canPair = false;
 
-  sock = makeWASocket({
+  const s = makeWASocket({
     version,
     auth: state,
     logger: pino({ level: 'silent' }),
-    // Pairing codes need a standard browser identity
     browser: Browsers.ubuntu('Chrome'),
     printQRInTerminal: false,
+    qrTimeout: 120000, // keep the pairing window open longer
   });
+  sock = s;
 
-  sock.ev.on('creds.update', saveCreds);
+  s.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+  s.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+    if (myGen !== gen) return;
+
     // A QR event means the socket is ready to be paired
     if (qr) canPair = true;
 
@@ -89,16 +97,26 @@ async function startBot() {
       canPair = false;
       const code = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
-      console.log(`Connection closed (code ${code}).`, loggedOut ? 'Logged out.' : 'Reconnecting...');
+      console.log(`Connection closed (code ${code}).`, loggedOut ? 'Logged out.' : '');
+
       if (loggedOut && auth.clear) {
         await auth.clear();
-        console.log('Session cleared. Open the pair link to link again.');
+        console.log('Session cleared.');
       }
+
+      // Pairing window ran out and nothing is linked: stay idle until a new pair request
+      const idle = !s.authState.creds.registered && code === DisconnectReason.timedOut && !loggedOut;
+      if (idle) {
+        console.log('Pairing window ended. Waiting for a new pair request.');
+        return;
+      }
+
+      console.log('Reconnecting...');
       startBot();
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  s.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
@@ -121,7 +139,7 @@ async function startBot() {
         const cmd = commands.get(name.toLowerCase());
         if (!cmd) continue;
 
-        await cmd.run({ sock, msg, from, sender, args, commands, config });
+        await cmd.run({ sock: s, msg, from, sender, args, commands, config });
       } catch (err) {
         console.error('Error handling message:', err);
       }
@@ -129,9 +147,20 @@ async function startBot() {
   });
 }
 
+// Start a brand new socket so the pairing code gets its full lifetime
+async function freshSocket() {
+  const old = sock;
+  const p = startBot(); // bumps gen right away, so the old socket's events are ignored
+  try {
+    old?.end(undefined);
+  } catch {}
+  await p;
+}
+
 // ---------- Web server (needed by Render + pair link) ----------
 const app = express();
 const PAIR_KEY = process.env.PAIR_KEY;
+let pairBusy = false;
 
 const page = (body) => `<!doctype html>
 <html><head><meta charset="utf-8">
@@ -148,6 +177,7 @@ app.get('/', (req, res) => {
   const status = isOnline ? '✅ Bot is online' : '⏳ Bot is not linked or still connecting';
   res.send(
     page(`<p>${status}</p>
+<p><b>Tip:</b> open WhatsApp first: Settings → Linked Devices → Link a Device → Link with phone number instead. Then tap the button below and enter the code quickly.</p>
 <form action="/pair" method="get">
 <input name="number" placeholder="Your number e.g. 2348012345678" inputmode="numeric" required>
 <input name="key" type="password" placeholder="Pair key" required>
@@ -157,6 +187,10 @@ app.get('/', (req, res) => {
 });
 
 app.get('/pair', async (req, res) => {
+  if (pairBusy) {
+    return res.status(429).send(page('<p>Another request is in progress. Wait a few seconds.</p><a href="/">Back</a>'));
+  }
+  pairBusy = true;
   try {
     if (!PAIR_KEY || req.query.key !== PAIR_KEY) {
       return res.status(403).send(page('<p>❌ Wrong pair key.</p><a href="/">Back</a>'));
@@ -165,15 +199,13 @@ app.get('/pair', async (req, res) => {
     if (!number) {
       return res.status(400).send(page('<p>Enter your number with country code.</p><a href="/">Back</a>'));
     }
-    if (!sock) {
-      return res.status(503).send(page('<p>Bot is starting, try again in a few seconds.</p><a href="/">Back</a>'));
-    }
-    if (sock.authState.creds.registered || isOnline) {
-      return res.send(page('<p>✅ Already linked.</p>'));
+    if (isOnline) {
+      return res.send(page('<p>✅ Already linked and online.</p>'));
     }
 
-    // Wait up to 15 seconds for the socket to be ready for pairing
-    for (let i = 0; i < 30 && !canPair; i++) await sleep(500);
+    // Always start a fresh socket so the code is as new as possible
+    await freshSocket();
+    for (let i = 0; i < 40 && !canPair; i++) await sleep(500);
     if (!canPair) {
       return res.status(503).send(page('<p>Not ready yet. Wait 10 seconds and try again.</p><a href="/">Back</a>'));
     }
@@ -181,12 +213,18 @@ app.get('/pair', async (req, res) => {
     const code = await sock.requestPairingCode(number);
     const pretty = code.match(/.{1,4}/g)?.join('-') || code;
     res.send(
-      page(`<p>Enter this code in WhatsApp:<br>Settings → Linked Devices → Link a Device → Link with phone number instead</p>
-<div class="code">${pretty}</div><p>Use it right away. It expires in about a minute. Don't refresh this page, because that makes a new code and cancels this one.</p>`)
+      page(`<p>Enter this code in WhatsApp now:</p>
+<div class="code">${pretty}</div>
+<button onclick="navigator.clipboard.writeText('${code}')">Copy code</button>
+<p id="t">Expires in about 90s</p>
+<p>WhatsApp may also show a notification. Tap it to open the code screen. Don't refresh this page, because that makes a new code and cancels this one.</p>
+<script>var s=90;setInterval(function(){s--;document.getElementById('t').textContent=s>0?('Expires in about '+s+'s'):'Expired. Go back and get a new code.';},1000);</script>`)
     );
   } catch (err) {
     console.error('Pair error:', err);
     res.status(500).send(page(`<p>Could not get a code: ${err.message}</p><a href="/">Back</a>`));
+  } finally {
+    pairBusy = false;
   }
 });
 
