@@ -30,28 +30,35 @@ const {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ---------- Load commands ----------
-const commands = new Map(); // unique commands by name (used by the menu)
-const lookup = new Map(); // name or alias -> command
+const commands = new Map();
+const lookup = new Map();
 const commandsDir = path.join(__dirname, 'commands');
+
 for (const file of fs.readdirSync(commandsDir).filter((f) => f.endsWith('.js'))) {
   const mod = await import(pathToFileURL(path.join(commandsDir, file)).href);
   const list = Array.isArray(mod.default) ? mod.default : [mod.default];
+
   for (const cmd of list) {
     commands.set(cmd.name, cmd);
     lookup.set(cmd.name, cmd);
-    for (const alias of cmd.aliases || []) lookup.set(alias, cmd);
+
+    for (const alias of cmd.aliases || []) {
+      lookup.set(alias, cmd);
+    }
   }
 }
+
 console.log(`Loaded ${commands.size} command(s): ${[...commands.keys()].join(', ')}`);
 
 function getText(msg) {
-  // Unwrap disappearing-message and view-once wrappers
   const m =
     msg.message?.ephemeralMessage?.message ||
     msg.message?.viewOnceMessage?.message ||
     msg.message?.documentWithCaptionMessage?.message ||
     msg.message;
+
   if (!m) return '';
+
   return (
     m.conversation ||
     m.extendedTextMessage?.text ||
@@ -65,11 +72,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Cache the WhatsApp version so we don't fetch it on every pair request
 let cachedVersion = null;
+
 async function getVersion() {
   if (cachedVersion) return cachedVersion;
+
   try {
     const { version, error } = await fetchLatestBaileysVersion();
+
     if (!error) cachedVersion = version;
+
     return version;
   } catch {
     return undefined;
@@ -80,7 +91,7 @@ async function getVersion() {
 function boot() {
   startBot().catch((err) => {
     console.error('Start failed, retrying in 5s:', err.message);
-    setTimeout(boot, 5000);
+    scheduleReconnect(5000);
   });
 }
 
@@ -88,7 +99,18 @@ function boot() {
 let sock = null;
 let isOnline = false;
 let canPair = false;
-let gen = 0; // each new socket gets a number; events from old sockets are ignored
+let gen = 0;
+let reconnectTimer = null;
+
+// Schedule only one reconnect, even if a socket emits multiple close events.
+function scheduleReconnect(delay = 3000) {
+  if (reconnectTimer) return;
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    boot();
+  }, delay);
+}
 
 async function startBot() {
   const myGen = ++gen;
@@ -96,10 +118,11 @@ async function startBot() {
   const auth = supabase
     ? await useSupabaseAuthState(baileys)
     : await useMultiFileAuthState(config.sessionDir);
+
   const { state, saveCreds } = auth;
   const version = await getVersion();
 
-  if (myGen !== gen) return; // a newer socket was requested while loading
+  if (myGen !== gen) return;
 
   canPair = false;
 
@@ -109,9 +132,10 @@ async function startBot() {
     logger: pino({ level: 'silent' }),
     browser: Browsers.ubuntu('Chrome'),
     printQRInTerminal: false,
-    qrTimeout: 120000, // keep the pairing window open longer
-    markOnlineOnConnect: !getSettings().ghost, // ghost mode: do not show as online
+    qrTimeout: 120000,
+    markOnlineOnConnect: !getSettings().ghost,
   });
+
   sock = s;
   attachFeatures(s);
 
@@ -120,39 +144,73 @@ async function startBot() {
   s.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (myGen !== gen) return;
 
-    // A QR event means the socket is ready to be paired
     if (qr) canPair = true;
 
     if (connection === 'open') {
       isOnline = true;
       canPair = false;
+
       console.log(`✅ ${config.botName} is online!`);
-      onConnected(s, config).catch((e) => console.error('[welcome] error:', e?.message || e));
+
+      onConnected(s, config).catch((e) =>
+        console.error('[welcome] error:', e?.message || e)
+      );
     }
 
     if (connection === 'close') {
       isOnline = false;
       canPair = false;
+
       onDisconnected();
+
       const code = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
-      console.log(`Connection closed (code ${code}).`, loggedOut ? 'Logged out.' : '');
 
-      if (loggedOut && auth.clear) {
-        await auth.clear();
-        await resetWelcome();
-        console.log('Session cleared.');
+      console.log(
+        `Connection closed (code ${code}).`,
+        loggedOut ? 'Logged out.' : ''
+      );
+
+      if (loggedOut) {
+        try {
+          // Supabase auth provides clear(); local multi-file auth does not.
+          if (typeof auth.clear === 'function') {
+            await auth.clear();
+          } else if (!supabase) {
+            await fs.promises.rm(config.sessionDir, {
+              recursive: true,
+              force: true,
+            });
+
+            await fs.promises.mkdir(config.sessionDir, {
+              recursive: true,
+            });
+          }
+
+          await resetWelcome();
+
+          console.log(
+            'Logged-out session cleared. Reconnecting for a new pairing session.'
+          );
+        } catch (err) {
+          console.error('Could not clear logged-out session:', err);
+        }
       }
 
-      // Pairing window ran out and nothing is linked: stay idle until a new pair request
-      const idle = !s.authState.creds.registered && code === DisconnectReason.timedOut && !loggedOut;
+      // Pairing window ran out and nothing is linked:
+      // stay idle until a new pair request.
+      const idle =
+        !s.authState.creds.registered &&
+        code === DisconnectReason.timedOut &&
+        !loggedOut;
+
       if (idle) {
         console.log('Pairing window ended. Waiting for a new pair request.');
         return;
       }
 
-      console.log('Reconnecting...');
-      boot();
+      console.log('Reconnecting in 3 seconds...');
+      scheduleReconnect(3000);
     }
   });
 
@@ -160,31 +218,49 @@ async function startBot() {
     for (const msg of messages) {
       try {
         if (!msg.message) continue;
+
         const from = msg.key.remoteJid;
+
         if (!from || from === 'status@broadcast') continue;
 
         // Live messages, plus recent ones sent from the owner's own phone
-        const age = Date.now() / 1000 - Number(msg.messageTimestamp || 0);
+        const age =
+          Date.now() / 1000 - Number(msg.messageTimestamp || 0);
+
         if (type !== 'notify' && age > 30) continue;
 
         const isGroup = from.endsWith('@g.us');
+
         const sender = isGroup
           ? msg.key.participantAlt || msg.key.participant
           : msg.key.remoteJidAlt || from;
 
-        if (!msg.key.fromMe) saveUser(sender, msg.pushName || null);
+        if (!msg.key.fromMe) {
+          saveUser(sender, msg.pushName || null);
+        }
 
         const body = getText(msg).trim();
-        if (body) console.log(`[msg] ${msg.key.fromMe ? 'me' : 'them'} ${from}: ${body.slice(0, 60)}`);
+
+        if (body) {
+          console.log(
+            `[msg] ${msg.key.fromMe ? 'me' : 'them'} ${from}: ${body.slice(0, 60)}`
+          );
+        }
+
         const isOwner = !!msg.key.fromMe;
         const usedPrefix = matchPrefix(body, isOwner, config.prefix);
+
         if (!usedPrefix) continue;
 
-        const [name, ...args] = body.slice(usedPrefix.length).split(/\s+/);
+        const [name, ...args] = body
+          .slice(usedPrefix.length)
+          .split(/\s+/);
+
         const cmd = lookup.get(name.toLowerCase());
+
         if (!cmd) continue;
 
-        // Sleep mode and private mode (set with the owner commands)
+        // Sleep mode and private mode
         if (!allowed(cmd.name, isOwner)) continue;
 
         const reply = (text, extra = {}) =>
@@ -195,15 +271,19 @@ async function startBot() {
           await reply('❌ Only the owner can use this command.');
           continue;
         }
+
         if ((cmd.group || cmd.admin) && !isGroup) {
           await reply('❌ This command works in groups only.');
           continue;
         }
+
         if (cmd.admin && !isOwner) {
           const meta = await s.groupMetadata(from);
+
           const isAdmin = meta.participants.some(
             (p) => p.admin && [p.id, p.lid, p.phoneNumber].includes(sender)
           );
+
           if (!isAdmin) {
             await reply('❌ Only group admins can use this command.');
             continue;
@@ -212,12 +292,23 @@ async function startBot() {
 
         try {
           await cmd.run({
-            sock: s, msg, from, sender, args, commands, config,
-            isOwner, isGroup, text: args.join(' '), reply,
+            sock: s,
+            msg,
+            from,
+            sender,
+            args,
+            commands,
+            config,
+            isOwner,
+            isGroup,
+            text: args.join(' '),
+            reply,
           });
         } catch (err) {
           console.error(`Command ${cmd.name} failed:`, err);
+
           const m = String(err?.message || '');
+
           await reply(
             /not-authorized|forbidden|admin/i.test(m)
               ? '❌ I need to be a group admin to do that.'
@@ -233,11 +324,18 @@ async function startBot() {
 
 // Start a brand new socket so the pairing code gets its full lifetime
 async function freshSocket() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
   const old = sock;
-  const p = startBot(); // bumps gen right away, so the old socket's events are ignored
+  const p = startBot();
+
   try {
     old?.end(undefined);
   } catch {}
+
   await p;
 }
 
@@ -258,7 +356,10 @@ input,button{width:100%;padding:12px;margin:6px 0;font-size:16px;box-sizing:bord
 <body><h2>${config.botName}</h2>${body}</body></html>`;
 
 app.get('/', (req, res) => {
-  const status = isOnline ? '✅ Bot is online' : '⏳ Bot is not linked or still connecting';
+  const status = isOnline
+    ? '✅ Bot is online'
+    : '⏳ Bot is not linked or still connecting';
+
   res.send(
     page(`<p>${status}</p>
 <p><b>Tip:</b> open WhatsApp first: Settings → Linked Devices → Link a Device → Link with phone number instead. Then tap the button below and enter the code quickly.</p>
@@ -272,30 +373,50 @@ app.get('/', (req, res) => {
 
 app.get('/pair', async (req, res) => {
   if (pairBusy) {
-    return res.status(429).send(page('<p>Another request is in progress. Wait a few seconds.</p><a href="/">Back</a>'));
+    return res
+      .status(429)
+      .send(
+        page('<p>Another request is in progress. Wait a few seconds.</p><a href="/">Back</a>')
+      );
   }
+
   pairBusy = true;
+
   try {
     if (!PAIR_KEY || req.query.key !== PAIR_KEY) {
-      return res.status(403).send(page('<p>❌ Wrong pair key.</p><a href="/">Back</a>'));
+      return res
+        .status(403)
+        .send(page('<p>❌ Wrong pair key.</p><a href="/">Back</a>'));
     }
+
     const number = String(req.query.number || '').replace(/\D/g, '');
+
     if (!number) {
-      return res.status(400).send(page('<p>Enter your number with country code.</p><a href="/">Back</a>'));
+      return res
+        .status(400)
+        .send(page('<p>Enter your number with country code.</p><a href="/">Back</a>'));
     }
+
     if (isOnline) {
       return res.send(page('<p>✅ Already linked and online.</p>'));
     }
 
     // Always start a fresh socket so the code is as new as possible
     await freshSocket();
-    for (let i = 0; i < 40 && !canPair; i++) await sleep(500);
+
+    for (let i = 0; i < 40 && !canPair; i++) {
+      await sleep(500);
+    }
+
     if (!canPair) {
-      return res.status(503).send(page('<p>Not ready yet. Wait 10 seconds and try again.</p><a href="/">Back</a>'));
+      return res
+        .status(503)
+        .send(page('<p>Not ready yet. Wait 10 seconds and try again.</p><a href="/">Back</a>'));
     }
 
     const code = await sock.requestPairingCode(number);
     const pretty = code.match(/.{1,4}/g)?.join('-') || code;
+
     res.send(
       page(`<p>Enter this code in WhatsApp now:</p>
 <div class="code">${pretty}</div>
@@ -306,14 +427,20 @@ app.get('/pair', async (req, res) => {
     );
   } catch (err) {
     console.error('Pair error:', err);
-    res.status(500).send(page(`<p>Could not get a code: ${err.message}</p><a href="/">Back</a>`));
+
+    res
+      .status(500)
+      .send(page(`<p>Could not get a code: ${err.message}</p><a href="/">Back</a>`));
   } finally {
     pairBusy = false;
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Web server on port ${PORT}`));
+
+app.listen(PORT, '0.0.0.0', () =>
+  console.log(`Web server on port ${PORT}`)
+);
 
 await loadSettings(config);
 boot();
