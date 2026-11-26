@@ -8,7 +8,7 @@ import * as baileysNs from '@whiskeysockets/baileys';
 
 import config from './config.js';
 import { supabase, saveUser } from './lib/db.js';
-import { loadSettings, getSettings, allowed, matchPrefix } from './lib/settings.js';
+import { loadSettings, getSettings, allowed, matchPrefix, runWithSession } from './lib/settings.js';
 import { onConnected, onDisconnected, resetWelcome } from './lib/welcome.js';
 import { attachFeatures } from './lib/features.js';
 import { useSupabaseAuthState } from './lib/supabaseAuth.js';
@@ -151,6 +151,7 @@ async function startSession(id) {
   const auth = await makeAuth(id);
   const { state, saveCreds } = auth;
   const version = await getVersion();
+  await loadSettings(config, id);
 
   if (myGen !== sess.gen) return sess;
 
@@ -164,11 +165,11 @@ async function startSession(id) {
     browser: Browsers.ubuntu('Chrome'),
     printQRInTerminal: false,
     qrTimeout: 120000,
-    markOnlineOnConnect: !getSettings().ghost,
+    markOnlineOnConnect: !getSettings(id).ghost,
   });
 
   sess.sock = s;
-  attachFeatures(s);
+  attachFeatures(s, id);
 
   s.ev.on('creds.update', saveCreds);
 
@@ -217,8 +218,9 @@ async function startSession(id) {
     }
   });
 
-  s.ev.on('messages.upsert', async ({ messages, type }) => {
+  s.ev.on('messages.upsert', (ev) => runWithSession(id, async () => {
     if (myGen !== sess.gen) return; // an older socket must never reply
+    const { messages, type } = ev;
 
     for (const msg of messages) {
       try {
@@ -246,14 +248,15 @@ async function startSession(id) {
 
         // "Owner" = the number this session is linked to (messages it sends itself)
         const isOwner = !!msg.key.fromMe;
-        const usedPrefix = matchPrefix(body, isOwner, config.prefix);
+        const sessionConfig = { ...config, prefix: getSettings(id).prefix || config.prefix };
+        const usedPrefix = matchPrefix(body, isOwner, sessionConfig.prefix);
         if (!usedPrefix) continue;
 
         const [name, ...args] = body.slice(usedPrefix.length).split(/\s+/);
         const cmd = lookup.get(name.toLowerCase());
         if (!cmd) continue;
 
-        if (!allowed(cmd.name, isOwner)) continue;
+        if (!allowed(cmd.name, isOwner, id)) continue;
 
         const reply = (text, extra = {}) =>
           s.sendMessage(from, { text, ...extra }, { quoted: msg });
@@ -288,7 +291,7 @@ async function startSession(id) {
             sender,
             args,
             commands,
-            config,
+            config: sessionConfig,
             isOwner,
             isGroup,
             text: args.join(' '),
@@ -307,7 +310,7 @@ async function startSession(id) {
         console.error(`[${id}] error handling message:`, err);
       }
     }
-  });
+  }));
 
   return sess;
 }
@@ -447,8 +450,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Web server on port ${PORT}`));
 
 // ---------- Boot: reconnect every saved number ----------
-await loadSettings(config);
-
 const saved = await listSavedSessions();
 console.log(`Found ${saved.length} saved session(s): ${saved.join(', ') || 'none'}`);
 
