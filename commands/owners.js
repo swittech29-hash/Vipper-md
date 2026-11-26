@@ -1,4 +1,5 @@
 import { getSettings, updateSettings } from '../lib/settings.js';
+import { diag } from '../lib/diag.js';
 
 // 1 to 3 symbols. No letters, numbers, spaces or @ (so normal chat never triggers commands)
 const PREFIX_RE = /^[^\s\w@]{1,3}$/u;
@@ -163,6 +164,41 @@ export default [
       }
       await updateSettings({ autolikestatus: v === 'on' });
       await reply(`${v === 'on' ? '✅' : '❌'} Auto like status is now *${v}* (${s.statusEmoji})`);
+    },
+  },
+  {
+    name: 'statuscheck',
+    category: 'SETTINGS',
+    owner: true,
+    description: 'Check that status viewing and liking are working',
+    async run({ reply }) {
+      const s = getSettings();
+      const ago = (t) => {
+        if (!t) return 'never';
+        const sec = Math.round((Date.now() - t) / 1000);
+        return sec < 90 ? `${sec}s ago` : sec < 5400 ? `${Math.round(sec / 60)} min ago` : `${Math.round(sec / 3600)} h ago`;
+      };
+      const like = diag.lastLike;
+      const lines = [
+        `📊 *Status check*`,
+        `Auto like: *${s.autolikestatus ? 'on' : 'off'}* (${s.statusEmoji}) | Auto view: *${s.autostatus ? 'on' : 'off'}*`,
+        `Bot running for: ${ago(diag.startedAt).replace(' ago', '')}`,
+        `Status updates seen: *${diag.statusEvents}* (yours: ${diag.ownStatusEvents})`,
+        `Last contact status: ${diag.lastStatusAt ? `${ago(diag.lastStatusAt)} from ${diag.lastStatusFrom}` : 'none yet'}`,
+        `Likes sent: *${diag.likesSent}* | failed: *${diag.likesFailed}*`,
+        like
+          ? like.ok
+            ? `Last like: ✅ sent ${ago(like.at)} (${like.method})`
+            : `Last like: ❌ failed ${ago(like.at)}: ${like.error}`
+          : 'Last like: none yet',
+      ];
+      if (diag.keyShape) lines.push(`Id format: ${diag.keyShape}`);
+      lines.push('');
+      if (!s.autolikestatus) lines.push(`➡️ Turn it on with ${'!'}autolikestatus on`);
+      else if (diag.statusEvents === 0) lines.push('➡️ The bot has seen no status updates yet. Post a status yourself, then run this again. If "yours" stays 0, statuses are not reaching the bot.');
+      else if (diag.statusEvents === diag.ownStatusEvents) lines.push('➡️ The bot sees your own statuses but none from contacts yet. Wait for a contact to post a new one.');
+      else if (like?.ok) lines.push('➡️ Likes are being sent. Ask the contact whether they see your reaction.');
+      await reply(lines.join('\n'));
     },
   },
   toggle('ghost', 'Ghost mode (appear offline)', {
