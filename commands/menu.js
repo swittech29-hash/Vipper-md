@@ -14,6 +14,7 @@ const CATEGORY_OVERRIDES = { setpp: 'OWNER' };
 
 const CATEGORIES = [
   ['OWNER', '👑'],
+  ['SETTINGS', '⚙️'],
   ['BOT', '💻'],
   ['GROUP', '👥'],
   ['AI', '🤖'],
