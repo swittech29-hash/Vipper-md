@@ -139,6 +139,32 @@ export default [
   toggle('autoreact', 'Auto react (private chats)'),
   toggle('autostatus', 'Auto view statuses'),
   toggle('autosavestatus', 'Auto save statuses to your chat'),
+  {
+    name: 'autolikestatus',
+    aliases: ['autolike'],
+    category: 'SETTINGS',
+    owner: true,
+    description: 'Auto like statuses (on/off)',
+    async run({ args, reply, config }) {
+      const p = config.prefix;
+      const s = getSettings();
+      const v = (args[0] || '').toLowerCase();
+      if (v === 'emoji') {
+        const e = args[1];
+        if (!e || e.length > 8 || /[\w\s]/.test(e)) return reply(`Use one emoji. Example: ${p}autolikestatus emoji 🔥`);
+        await updateSettings({ statusEmoji: e });
+        return reply(`✅ Status like emoji is now ${e}`);
+      }
+      if (!['on', 'off'].includes(v)) {
+        return reply(
+          `Auto like status: *${s.autolikestatus ? 'on' : 'off'}* (${s.statusEmoji})\n` +
+            `Use ${p}autolikestatus on or off\nChange the emoji: ${p}autolikestatus emoji 🔥`
+        );
+      }
+      await updateSettings({ autolikestatus: v === 'on' });
+      await reply(`${v === 'on' ? '✅' : '❌'} Auto like status is now *${v}* (${s.statusEmoji})`);
+    },
+  },
   toggle('ghost', 'Ghost mode (appear offline)', {
     async onChange({ sock }, on) {
       await sock.sendPresenceUpdate(on ? 'unavailable' : 'available').catch(() => {});
@@ -189,6 +215,7 @@ export default [
           `${on('autoreact')} autoreact\n` +
           `${on('autostatus')} autostatus\n` +
           `${on('autosavestatus')} autosavestatus\n` +
+          `${on('autolikestatus')} autolikestatus (${s.statusEmoji})\n` +
           `${on('ghost')} ghost\n` +
           `${on('antidelete')} antidelete\n` +
           `${on('antiedit')} antiedit`
