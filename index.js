@@ -9,6 +9,7 @@ import * as baileysNs from '@whiskeysockets/baileys';
 import config from './config.js';
 import { supabase, saveUser } from './lib/db.js';
 import { loadSettings, getSettings, allowed, matchPrefix } from './lib/settings.js';
+import { onConnected, onDisconnected, resetWelcome } from './lib/welcome.js';
 import { attachFeatures } from './lib/features.js';
 import { useSupabaseAuthState } from './lib/supabaseAuth.js';
 
@@ -126,17 +127,20 @@ async function startBot() {
       isOnline = true;
       canPair = false;
       console.log(`✅ ${config.botName} is online!`);
+      onConnected(s, config).catch((e) => console.error('[welcome] error:', e?.message || e));
     }
 
     if (connection === 'close') {
       isOnline = false;
       canPair = false;
+      onDisconnected();
       const code = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
       console.log(`Connection closed (code ${code}).`, loggedOut ? 'Logged out.' : '');
 
       if (loggedOut && auth.clear) {
         await auth.clear();
+        await resetWelcome();
         console.log('Session cleared.');
       }
 
