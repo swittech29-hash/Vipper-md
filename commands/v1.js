@@ -35,6 +35,7 @@ export default {
       // Prefer the copy saved when the message arrived: the quoted copy
       // usually has no download link left in it.
       const saved = getViewOnce(sessionId, ctx.stanzaId);
+      console.log(`[v1:${sessionId}] looking for`, ctx.stanzaId, '| saved copy found:', !!saved);
       const source = saved?.message || quoted;
 
       const q = source.ephemeralMessage?.message || source;
