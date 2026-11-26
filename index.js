@@ -8,7 +8,8 @@ import * as baileysNs from '@whiskeysockets/baileys';
 
 import config from './config.js';
 import { supabase, saveUser } from './lib/db.js';
-import { loadSettings, allowed, matchPrefix } from './lib/settings.js';
+import { loadSettings, getSettings, allowed, matchPrefix } from './lib/settings.js';
+import { attachFeatures } from './lib/features.js';
 import { useSupabaseAuthState } from './lib/supabaseAuth.js';
 
 // Works with both Baileys 6.x (CommonJS) and 7.x (ESM)
@@ -108,8 +109,10 @@ async function startBot() {
     browser: Browsers.ubuntu('Chrome'),
     printQRInTerminal: false,
     qrTimeout: 120000, // keep the pairing window open longer
+    markOnlineOnConnect: !getSettings().ghost, // ghost mode: do not show as online
   });
   sock = s;
+  attachFeatures(s);
 
   s.ev.on('creds.update', saveCreds);
 
