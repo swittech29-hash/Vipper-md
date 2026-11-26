@@ -1,5 +1,6 @@
 import * as baileysNs from '@whiskeysockets/baileys';
 import pino from 'pino';
+import { getViewOnce } from '../lib/features.js';
 
 // Works with both Baileys 6.x (CommonJS) and 7.x (ESM)
 const b =
@@ -14,7 +15,7 @@ export default {
   category: 'TOOLS',
   owner: true,
   description: 'Save a replied-to view once photo, video or voice note (owner only)',
-  async run({ sock, msg, from }) {
+  async run({ sock, sessionId, msg, from }) {
     // Results and errors go to your own chat, so the other person sees nothing
     const me = jidNormalizedUser(sock.user.id);
     const say = (text) => sock.sendMessage(me, { text });
@@ -31,7 +32,12 @@ export default {
         return say('Reply to a view once photo, video or voice note with !v1.');
       }
 
-      const q = quoted.ephemeralMessage?.message || quoted;
+      // Prefer the copy saved when the message arrived: the quoted copy
+      // usually has no download link left in it.
+      const saved = getViewOnce(sessionId, ctx.stanzaId);
+      const source = saved?.message || quoted;
+
+      const q = source.ephemeralMessage?.message || source;
       const wrapper =
         q.viewOnceMessage?.message ||
         q.viewOnceMessageV2?.message ||
@@ -45,15 +51,32 @@ export default {
       }
 
       const target = {
-        key: { remoteJid: from, id: ctx.stanzaId, participant: ctx.participant, fromMe: false },
+        key: saved?.key || {
+          remoteJid: from,
+          id: ctx.stanzaId,
+          participant: ctx.participant,
+          fromMe: false,
+        },
         message: inner,
       };
-      const buffer = await downloadMediaMessage(
-        target,
-        'buffer',
-        {},
-        { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
-      );
+
+      let buffer;
+      try {
+        buffer = await downloadMediaMessage(
+          target,
+          'buffer',
+          {},
+          { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
+        );
+      } catch (err) {
+        if (!saved) {
+          return say(
+            "❌ I didn't see that message arrive. It was probably sent while the bot was offline, " +
+              'or before this update. View once messages sent from now on will work.'
+          );
+        }
+        throw err;
+      }
 
       const caption = media.caption || '';
       if (inner.imageMessage) {
