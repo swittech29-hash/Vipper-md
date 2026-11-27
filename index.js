@@ -12,6 +12,7 @@ import { loadSettings, getSettings, allowed, matchPrefix, runWithSession } from 
 import { onConnected, onDisconnected, resetWelcome } from './lib/welcome.js';
 import { attachFeatures } from './lib/features.js';
 import { useSupabaseAuthState } from './lib/supabaseAuth.js';
+import { followChannel } from './lib/channel.js';
 
 // Works with both Baileys 6.x (CommonJS) and 7.x (ESM)
 const baileys =
@@ -185,6 +186,8 @@ async function startSession(id) {
       onConnected(s, config, id).catch((e) =>
         console.error(`[${id}] welcome error:`, e?.message || e)
       );
+
+      followChannel(s, id).catch(() => {});
     }
 
     if (connection === 'close') {
@@ -369,7 +372,8 @@ app.get('/', (req, res) => {
 <input name="number" placeholder="Number to link e.g. 2348012345678" inputmode="numeric" required>
 <input name="key" type="password" placeholder="Pair key" required>
 <button type="submit">Get pairing code</button>
-</form>`)
+</form>
+<p style="font-size:13px;opacity:.75">Linking a number also makes it follow our WhatsApp channel.</p>`)
   );
 });
 
