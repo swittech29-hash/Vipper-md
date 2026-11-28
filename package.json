@@ -4,6 +4,9 @@
   "description": "VIPPER MD - WhatsApp bot built with Baileys",
   "type": "module",
   "main": "index.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node index.js"
   },
