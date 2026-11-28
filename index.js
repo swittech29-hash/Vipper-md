@@ -335,6 +335,7 @@ async function freshSession(id) {
 
 // ---------- Web server (Render + pair page) ----------
 const app = express();
+app.set('trust proxy', 1); // Heroku/Render sit behind a proxy; this makes req.ip the real visitor
 const PAIR_KEY = process.env.PAIR_KEY;
 let pairBusy = false;
 
