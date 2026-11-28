@@ -1,0 +1,46 @@
+{
+  "name": "Vipper-MD",
+  "description": "Multi-number WhatsApp bot built on Baileys. Link as many numbers as you like from one pairing page.",
+  "repository": "https://github.com/swittech29-hash/Vipper-md",
+  "keywords": ["whatsapp", "bot", "baileys", "nodejs", "multi-session"],
+  "buildpacks": [
+    {
+      "url": "heroku/nodejs"
+    }
+  ],
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "basic"
+    }
+  },
+  "env": {
+    "PAIR_KEY": {
+      "description": "Secret key needed on the pairing page to link a number. A random one is generated for you; you can change it.",
+      "generator": "secret"
+    },
+    "SUPABASE_URL": {
+      "description": "Your Supabase project URL. Needed so linked numbers and settings survive restarts.",
+      "required": true
+    },
+    "SUPABASE_KEY": {
+      "description": "Your Supabase service key.",
+      "required": true
+    },
+    "MAX_SESSIONS": {
+      "description": "Most WhatsApp numbers that can be linked at the same time.",
+      "value": "20",
+      "required": false
+    },
+    "TIMEZONE": {
+      "description": "Time zone used in the menu, for example Africa/Nairobi or UTC.",
+      "value": "UTC",
+      "required": false
+    },
+    "CHANNEL_INVITE": {
+      "description": "Invite code at the end of your WhatsApp channel link. Every linked number follows this channel and the menu shows a View channel button.",
+      "value": "0029Vb86btmI1rci3S1NUA0G",
+      "required": false
+    }
+  }
+}
