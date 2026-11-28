@@ -377,7 +377,7 @@ async function freshSession(id) {
 // ---------- Web server (pair page) ----------
 const app = express();
 app.set('trust proxy', 1); // Heroku/Render sit behind a proxy; this makes req.ip the real visitor
-const PAIR_KEY = process.env.PAIR_KEY;
+const PAIR_KEY = process.env.PAIR_KEY || '123'; // shown on the pairing page, so treat it as public
 let pairBusy = false;
 
 // Very small brute-force guard: 5 wrong keys per IP per 15 minutes
@@ -397,7 +397,7 @@ const page = (body) => renderPage(config.botName, body);
 app.get('/', (req, res) => {
   const total = sessions.size;
   const online = [...sessions.values()].filter((s) => s.isOnline).length;
-  res.send(page(homeBody({ online, total })));
+  res.send(page(homeBody({ online, total, pairKey: PAIR_KEY })));
 });
 
 // Checks shared by "Get Pair Code" and "Scan QR Code".
@@ -518,8 +518,8 @@ app.get('/status', (req, res) => {
 });
 
 // ---------- Admin dashboard (/admin) ----------
-// Protected by ADMIN_KEY. If you don't set one, PAIR_KEY is used instead.
-const ADMIN_KEY = process.env.ADMIN_KEY || process.env.PAIR_KEY;
+// Protected by its own ADMIN_KEY. The pair key is public, so it is never used here.
+const ADMIN_KEY = process.env.ADMIN_KEY;
 const adminToken = ADMIN_KEY
   ? crypto.createHmac('sha256', ADMIN_KEY).update('admin-session').digest('hex')
   : null;
@@ -553,7 +553,7 @@ async function loadUsers() {
 
 app.get('/admin', (req, res) => {
   if (!ADMIN_KEY) {
-    return res.status(503).send(loginPage(config.botName, 'Set ADMIN_KEY (or PAIR_KEY) to turn on the dashboard.'));
+    return res.status(503).send(loginPage(config.botName, 'Set ADMIN_KEY in your settings to turn on the dashboard.'));
   }
   res.send(isAdmin(req) ? dashboardPage(config.botName) : loginPage(config.botName));
 });
