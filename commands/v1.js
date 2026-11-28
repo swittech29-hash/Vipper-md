@@ -4,9 +4,11 @@ import pino from 'pino';
 // Loaded this way so the command still loads (and shows in the menu) even if
 // lib/features.js is an older version without the saved-copy helper.
 let getViewOnce = () => null;
+let viewOnceCount = () => 0;
 try {
   const mod = await import('../lib/features.js');
   if (typeof mod.getViewOnce === 'function') getViewOnce = mod.getViewOnce;
+  if (typeof mod.viewOnceCount === 'function') viewOnceCount = mod.viewOnceCount;
   else console.error('[v1] lib/features.js is an old version: replace it with the latest one.');
 } catch (err) {
   console.error('[v1] could not load lib/features.js:', err.message);
@@ -57,7 +59,8 @@ export default {
 
       const media = inner.imageMessage || inner.videoMessage || inner.audioMessage;
       // Newer WhatsApp versions mark the media itself with viewOnce: true
-      if (!media || !(wrapper || media.viewOnce)) {
+      // If we saved the original ourselves, trust that the person replied to the right message
+      if (!media || !(wrapper || media.viewOnce || saved)) {
         return say('The replied message is not a view once photo, video or voice note.');
       }
 
@@ -81,9 +84,14 @@ export default {
         );
       } catch (err) {
         if (!saved) {
+          const yn = (v) => (v ? 'yes' : 'no');
           return say(
-            "❌ I didn't see that message arrive. It was probably sent while the bot was offline, " +
-              'or before this update. View once messages sent from now on will work.'
+            "❌ I didn't see that message arrive, so I can't unlock it.\n\n" +
+              `Photos/videos/voice notes seen since the bot started: ${viewOnceCount(sessionId)}\n` +
+              `Replied message id: ${ctx.stanzaId}\n` +
+              `Your reply still has a download link: ${yn(media.url || media.directPath)}\n\n` +
+              'Ask the person to send a NEW one now, wait a few seconds, then reply to it with the command. ' +
+              'If the count above stays at 0 after that, WhatsApp is not delivering it to this linked device.'
           );
         }
         throw err;
