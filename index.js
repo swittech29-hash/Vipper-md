@@ -16,6 +16,7 @@ import { useSupabaseAuthState } from './lib/supabaseAuth.js';
 import { followChannel } from './lib/channel.js';
 import { page as renderPage, notice, homeBody, pairBody, qrBody } from './lib/portal.js';
 import { loginPage, dashboardPage } from './lib/admin.js';
+import { protectSocket, commandGate } from './lib/antiban.js';
 
 // Works with both Baileys 6.x (CommonJS) and 7.x (ESM)
 const baileys =
@@ -120,13 +121,17 @@ async function listSavedSessions() {
 
 function scheduleReconnect(sess, delay = 3000) {
   if (sess.timer) return;
+  // Wait longer after each failed try (3s, 6s, 12s ... up to 5 min).
+  // Reconnecting in a tight loop looks robotic to WhatsApp.
+  const wait = Math.min(delay * 2 ** (sess.retries || 0), 5 * 60 * 1000);
+  sess.retries = (sess.retries || 0) + 1;
   sess.timer = setTimeout(() => {
     sess.timer = null;
     startSession(sess.id).catch((err) => {
       console.error(`[${sess.id}] start failed, retrying in 5s:`, err.message);
       scheduleReconnect(sess, 5000);
     });
-  }, delay);
+  }, wait);
 }
 
 async function wipeAuth(sess) {
@@ -173,6 +178,8 @@ async function startSession(id) {
   });
 
   sess.sock = s;
+  // Every message this number sends now goes through the throttle (delays, limits)
+  protectSocket(s, id, { isGhost: () => !!getSettings(id).ghost });
   attachFeatures(s, id);
 
   s.ev.on('creds.update', saveCreds);
@@ -200,6 +207,7 @@ async function startSession(id) {
 
       sess.isOnline = true;
       sess.onlineSince = Date.now();
+      sess.retries = 0; // connected fine, so reset the reconnect delay
       sess.canPair = false;
       console.log(`✅ [${id}] ${config.botName} is online!`);
       onConnected(s, config, id).catch((e) =>
@@ -281,6 +289,9 @@ async function startSession(id) {
         if (!cmd) continue;
 
         if (!allowed(cmd.name, isOwner, id)) continue;
+
+        // Ignore command spam, so the bot can't be pushed into a reply flood
+        if (!commandGate({ sessionId: id, chat: from, sender, isOwner })) continue;
 
         const reply = (text, extra = {}) =>
           s.sendMessage(from, { text, ...extra }, { quoted: msg });
