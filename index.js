@@ -9,12 +9,13 @@ import * as baileysNs from '@whiskeysockets/baileys';
 
 import config from './config.js';
 import { supabase, saveUser } from './lib/db.js';
-import { loadSettings, getSettings, allowed, matchPrefix, runWithSession } from './lib/settings.js';
+import { loadSettings, getSettings, updateSettings, allowed, matchPrefix, runWithSession } from './lib/settings.js';
 import { onConnected, onDisconnected, resetWelcome } from './lib/welcome.js';
 import { attachFeatures } from './lib/features.js';
 import { useSupabaseAuthState } from './lib/supabaseAuth.js';
 import { followChannel } from './lib/channel.js';
-import { page as renderPage, notice, homeBody, pairBody, qrBody } from './lib/portal.js';
+import { page as renderPage, notice, homeBody, pairBody, qrBody, restoreBody } from './lib/portal.js';
+import { credsToCode, decodeCode, seedCreds } from './lib/restore.js';
 import { loginPage, dashboardPage } from './lib/admin.js';
 import { protectSocket, commandGate } from './lib/antiban.js';
 
@@ -85,6 +86,21 @@ async function getVersion() {
     return version;
   } catch {
     return undefined;
+  }
+}
+
+// Short, readable session ID for each linked number, like K7M2-Q9XA-4TBH.
+// Letters that look alike (0/O, 1/I) are left out.
+// IMPORTANT: this ID is a RESTORE KEY. Whoever has it can move the linked device
+// to another bot (see /restore below), so treat it like a password.
+const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function makeSessionCode() {
+  for (;;) {
+    let c = '';
+    for (const b of crypto.randomBytes(12)) c += CODE_CHARS[b % CODE_CHARS.length];
+    const code = `${c.slice(0, 4)}-${c.slice(4, 8)}-${c.slice(8)}`;
+    const taken = [...sessions.keys()].some((k) => getSettings(k).sessionCode === code);
+    if (!taken) return code;
   }
 }
 
@@ -205,6 +221,31 @@ async function startSession(id) {
         return;
       }
 
+      // Give this number a short session ID the first time it connects
+      const haveCode = getSettings(id).sessionCode;
+      if (!haveCode || haveCode.length < 14) {
+        await updateSettings({ sessionCode: makeSessionCode() }, id);
+      }
+
+      // Give it a portable session code too, and send it ONCE, privately, in
+      // its own WhatsApp chat. This code is as sensitive as a password.
+      if (!getSettings(id).restoreCodeSent) {
+        try {
+          const restoreCode = credsToCode(baileys, state.creds);
+          await updateSettings({ restoreCodeSent: true }, id);
+          await s.sendMessage(baileys.jidNormalizedUser(s.user.id), {
+            text:
+              '🔐 *Session code* (keep this private, do not share it)\n\n' +
+              'Anyone who has this code can control this WhatsApp number through the bot. ' +
+              'Save it somewhere safe. Use it to restore this session on another deployment, ' +
+              'without scanning or pairing again.\n\n' +
+              restoreCode,
+          });
+        } catch (e) {
+          console.error(`[${id}] could not send session code:`, e.message);
+        }
+      }
+
       sess.isOnline = true;
       sess.onlineSince = Date.now();
       sess.retries = 0; // connected fine, so reset the reconnect delay
@@ -232,6 +273,7 @@ async function startSession(id) {
       if (loggedOut) {
         await wipeAuth(sess);
         await Promise.resolve(resetWelcome(id)).catch(() => {});
+        await updateSettings({ sessionCode: null }, id); // the ID stops working
         sessions.delete(id);
         console.log(`[${id}] session removed.`);
         return;
@@ -505,6 +547,66 @@ app.post('/qr', express.urlencoded({ extended: false }), async (req, res) => {
 });
 
 // The pair/QR page asks this every few seconds (needs the token it was given)
+app.post('/restore', express.urlencoded({ extended: false }), async (req, res) => {
+  const ip = req.ip;
+
+  if (tooManyFails(ip)) {
+    return res.status(429).send(page(notice('Too many wrong keys. Try again later.', false)));
+  }
+  if (!PAIR_KEY || req.body?.key !== PAIR_KEY) {
+    recordFail(ip);
+    return res.status(403).send(page(notice('❌ Wrong pair key.')));
+  }
+  if (pairBusy) {
+    return res.status(429).send(page(notice('Another request is in progress. Wait a few seconds.')));
+  }
+
+  pairBusy = true;
+  try {
+    let id, json;
+    try {
+      ({ id, json } = decodeCode(baileys, req.body.code));
+    } catch (err) {
+      return res.status(400).send(page(notice(`❌ ${esc(err.message)}`)));
+    }
+
+    const existing = sessions.get(id);
+    if (existing?.isOnline) {
+      return res.send(page(notice('✅ That number is already linked and online.')));
+    }
+    if (!existing && sessions.size >= MAX_SESSIONS) {
+      return res.status(400).send(page(notice(`Limit of ${MAX_SESSIONS} numbers reached.`)));
+    }
+
+    await seedCreds(id, json, config.sessionDir);
+
+    const sess = await freshSession(id);
+    sess.token = crypto.randomBytes(16).toString('hex');
+
+    // Registered creds reconnect on their own, with no code or QR needed.
+    // Wait to see whether WhatsApp accepts it or rejects it (bad/expired code).
+    for (let i = 0; i < 30 && !sess.isOnline && sess.gen === sessions.get(id)?.gen; i++) {
+      await sleep(500);
+    }
+
+    if (!sessions.has(id)) {
+      // Removed itself already: WhatsApp rejected the credentials (e.g. logged out elsewhere)
+      return res.status(400).send(
+        page(notice('❌ That code did not work. It may be expired, already in use elsewhere, or revoked.'))
+      );
+    }
+
+    res.send(page(restoreBody({ number: id, token: sess.token, online: sess.isOnline })));
+  } catch (err) {
+    console.error('Restore error:', err);
+    if (!res.headersSent) {
+      res.status(500).send(page(notice(`Could not restore: ${esc(err.message)}`)));
+    }
+  } finally {
+    pairBusy = false;
+  }
+});
+
 app.get('/status', (req, res) => {
   res.set('Cache-Control', 'no-store');
   const number = String(req.query.number || '').replace(/\D/g, '');
@@ -513,7 +615,9 @@ app.get('/status', (req, res) => {
   if (!sess || !sess.token || req.query.token !== sess.token) {
     return res.json({ state: 'ended' });
   }
-  if (sess.isOnline) return res.json({ state: 'online' });
+  if (sess.isOnline) {
+    return res.json({ state: 'online', code: getSettings(sess.id).sessionCode || null });
+  }
   res.json({ state: 'waiting', qr: sess.viaQr ? sess.qr || null : null });
 });
 
@@ -590,6 +694,7 @@ app.get('/admin/data', async (req, res) => {
       online: !!s.isOnline,
       linked: !!s.sock?.authState?.creds?.registered,
       since: s.onlineSince || null,
+      code: getSettings(s.id).sessionCode || null,
     }))
     .sort((a, b) => Number(b.online) - Number(a.online) || a.id.localeCompare(b.id));
 
@@ -617,6 +722,7 @@ async function removeSession(sess) {
 
   await wipeAuth(sess);
   await Promise.resolve(resetWelcome(sess.id)).catch(() => {});
+  await updateSettings({ sessionCode: null }, sess.id); // the ID stops working
   sessions.delete(sess.id);
 }
 
@@ -636,10 +742,119 @@ app.post('/admin/disconnect', express.json({ limit: '1kb' }), async (req, res) =
   }
 });
 
+// ---------- Move a session to another bot: GET /restore/<session ID> ----------
+// The session ID is a password: whoever has it can take over the linked device.
+// Using it MOVES the session. This bot lets go of the number, so WhatsApp never
+// sees the same login running in two places at once.
+
+// Stops a number here WITHOUT unlinking it from WhatsApp
+async function releaseSession(sess) {
+  if (sess.timer) {
+    clearTimeout(sess.timer);
+    sess.timer = null;
+  }
+  sess.gen++;
+  sess.isOnline = false;
+  sess.onlineSince = null;
+  sess.qr = null;
+  onDisconnected(sess.id);
+  try {
+    sess.sock?.end(undefined);
+  } catch {}
+  await wipeAuth(sess); // removes the saved login from here, but does not log out
+  await updateSettings({ sessionCode: null }, sess.id);
+  sessions.delete(sess.id);
+}
+
+app.get('/restore/:id', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (tooManyFails(req.ip)) {
+    return res.status(429).json({ error: 'Too many tries. Try again later.' });
+  }
+
+  const wanted = String(req.params.id || '').trim().toUpperCase();
+  const sess =
+    wanted.length >= 14
+      ? [...sessions.values()].find((s) => getSettings(s.id).sessionCode === wanted)
+      : null;
+  const creds = sess?.sock?.authState?.creds;
+
+  if (!sess || !creds?.registered) {
+    recordFail(req.ip);
+    return res.status(404).json({ error: 'Unknown or already used session ID.' });
+  }
+
+  // Lets the other bot check the number first, before anything is moved
+  if (req.query.info === '1') return res.json({ ok: true, number: sess.id });
+
+  if (req.query.move !== '1') {
+    return res
+      .status(400)
+      .json({ error: 'Restoring moves the session away from this bot. Add ?move=1 to confirm.' });
+  }
+
+  res.type('application/json').send(JSON.stringify(creds, baileys.BufferJSON.replacer));
+  res.once('finish', () => {
+    releaseSession(sess)
+      .then(() => console.log(`[${sess.id}] moved to another bot (session ID used).`))
+      .catch((err) => console.error(`[${sess.id}] release failed:`, err));
+  });
+});
+
+// Brings a session in from another bot. Set SESSION_URL (that bot's web address)
+// and SESSION_ID (the ID it gave you). It moves here once, on first start.
+async function importSession(baseUrl, sessionId) {
+  const root = baseUrl.trim().replace(/\/+$/, '');
+  const id = encodeURIComponent(sessionId.trim());
+  try {
+    const info = await fetch(`${root}/restore/${id}?info=1`);
+    if (info.status === 404) {
+      console.log('[restore] session ID not found: it was already used, or it is wrong.');
+      return;
+    }
+    if (!info.ok) {
+      console.error('[restore] could not reach the other bot:', info.status);
+      return;
+    }
+    const { number } = await info.json();
+
+    if ((await listSavedSessions()).includes(number)) {
+      console.log(`[restore] ${number} is already here, nothing to do.`);
+      return;
+    }
+
+    const res = await fetch(`${root}/restore/${id}?move=1`);
+    if (!res.ok) {
+      console.error('[restore] move failed:', res.status);
+      return;
+    }
+    const text = await res.text();
+    JSON.parse(text, baileys.BufferJSON.reviver); // must be valid before it is saved
+
+    if (supabase) {
+      const { error } = await supabase
+        .from('auth_state')
+        .upsert({ id: `${number}:creds`, data: text }, { onConflict: 'id' });
+      if (error) throw new Error(error.message);
+    } else {
+      const dir = path.join(config.sessionDir, number);
+      await fs.promises.mkdir(dir, { recursive: true });
+      await fs.promises.writeFile(path.join(dir, 'creds.json'), text);
+    }
+    console.log(`[restore] ${number} restored here.`);
+  } catch (err) {
+    console.error('[restore] failed (if the session was already moved, the number must be paired again):', err.message);
+  }
+}
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Web server on port ${PORT}`));
 
 // ---------- Boot: reconnect every saved number ----------
+if (process.env.SESSION_ID && process.env.SESSION_URL) {
+  await importSession(process.env.SESSION_URL, process.env.SESSION_ID);
+}
+
 const saved = await listSavedSessions();
 console.log(`Found ${saved.length} saved session(s): ${saved.join(', ') || 'none'}`);
 
