@@ -22,8 +22,9 @@
   },
   "env": {
     "PAIR_KEY": {
-      "description": "Secret key needed on the pairing page to link a number. A random one is generated for you; you can change it.",
-      "generator": "secret"
+      "description": "Key shown on the pairing page and needed to link a number.",
+      "value": "123",
+      "required": false
     },
     "ADMIN_KEY": {
       "description": "Key for the /admin dashboard that shows linked numbers and users. A random one is generated for you; keep it private.",
