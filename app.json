@@ -2,7 +2,13 @@
   "name": "Vipper-MD",
   "description": "Multi-number WhatsApp bot built on Baileys. Link as many numbers as you like from one pairing page.",
   "repository": "https://github.com/swittech29-hash/Vipper-md",
-  "keywords": ["whatsapp", "bot", "baileys", "nodejs", "multi-session"],
+  "keywords": [
+    "whatsapp",
+    "bot",
+    "baileys",
+    "nodejs",
+    "multi-session"
+  ],
   "buildpacks": [
     {
       "url": "heroku/nodejs"
@@ -17,6 +23,10 @@
   "env": {
     "PAIR_KEY": {
       "description": "Secret key needed on the pairing page to link a number. A random one is generated for you; you can change it.",
+      "generator": "secret"
+    },
+    "ADMIN_KEY": {
+      "description": "Key for the /admin dashboard that shows linked numbers and users. A random one is generated for you; keep it private.",
       "generator": "secret"
     },
     "SUPABASE_URL": {
