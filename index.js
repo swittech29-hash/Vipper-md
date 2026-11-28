@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import pino from 'pino';
 import express from 'express';
 import { fileURLToPath, pathToFileURL } from 'url';
@@ -13,6 +14,7 @@ import { onConnected, onDisconnected, resetWelcome } from './lib/welcome.js';
 import { attachFeatures } from './lib/features.js';
 import { useSupabaseAuthState } from './lib/supabaseAuth.js';
 import { followChannel } from './lib/channel.js';
+import { page as renderPage, notice, homeBody, pairBody, qrBody } from './lib/portal.js';
 
 // Works with both Baileys 6.x (CommonJS) and 7.x (ESM)
 const baileys =
@@ -177,9 +179,24 @@ async function startSession(id) {
   s.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (myGen !== sess.gen) return;
 
-    if (qr) sess.canPair = true;
+    if (qr) {
+      sess.canPair = true;
+      sess.qr = qr; // the pairing page shows this when someone picks "Scan QR"
+    }
 
     if (connection === 'open') {
+      sess.qr = null;
+
+      // Linked by QR, but scanned with a different number than the one typed:
+      // undo it, so each number is stored under its own name.
+      const jid = String(s.user?.id || '');
+      const realNumber = jid.split(':')[0].split('@')[0];
+      if (sess.viaQr && jid.endsWith('@s.whatsapp.net') && realNumber && realNumber !== id) {
+        console.log(`[${id}] scanned with ${realNumber} instead. Unlinking.`);
+        await s.logout().catch(() => {});
+        return;
+      }
+
       sess.isOnline = true;
       sess.canPair = false;
       console.log(`✅ [${id}] ${config.botName} is online!`);
@@ -193,6 +210,7 @@ async function startSession(id) {
     if (connection === 'close') {
       sess.isOnline = false;
       sess.canPair = false;
+      sess.qr = null;
       onDisconnected(id);
 
       const code = lastDisconnect?.error?.output?.statusCode;
@@ -333,7 +351,7 @@ async function freshSession(id) {
   return p;
 }
 
-// ---------- Web server (Render + pair page) ----------
+// ---------- Web server (pair page) ----------
 const app = express();
 app.set('trust proxy', 1); // Heroku/Render sit behind a proxy; this makes req.ip the real visitor
 const PAIR_KEY = process.env.PAIR_KEY;
@@ -351,104 +369,129 @@ function recordFail(ip) {
   else f.n++;
 }
 
-const page = (body) => `<!doctype html>
-<html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${esc(config.botName)}</title>
-<style>
-body{font-family:system-ui,sans-serif;max-width:420px;margin:40px auto;padding:0 16px;text-align:center}
-input,button{width:100%;padding:12px;margin:6px 0;font-size:16px;box-sizing:border-box}
-.code{font-size:32px;letter-spacing:4px;font-weight:700;margin:16px 0}
-</style></head>
-<body><h2>${esc(config.botName)}</h2>${body}</body></html>`;
+const page = (body) => renderPage(config.botName, body);
 
 app.get('/', (req, res) => {
   const total = sessions.size;
   const online = [...sessions.values()].filter((s) => s.isOnline).length;
-
-  res.send(
-    page(`<p>✅ ${online} online / ${total} linked number(s)</p>
-<p><b>Tip:</b> open WhatsApp first: Settings → Linked Devices → Link a Device → Link with phone number instead. Then tap the button below and enter the code quickly.</p>
-<form action="/pair" method="post">
-<input name="number" placeholder="Number to link e.g. 2348012345678" inputmode="numeric" required>
-<input name="key" type="password" placeholder="Pair key" required>
-<button type="submit">Get pairing code</button>
-</form>
-<p style="font-size:13px;opacity:.75">Linking a number also makes it follow our WhatsApp channel.</p>`)
-  );
+  res.send(page(homeBody({ online, total })));
 });
 
-app.post('/pair', express.urlencoded({ extended: false }), async (req, res) => {
+// Checks shared by "Get Pair Code" and "Scan QR Code".
+// Returns the number, or null after sending an error page.
+function checkRequest(req, res) {
   const ip = req.ip;
 
-  // Check the key first, before anything else happens
   if (tooManyFails(ip)) {
-    return res.status(429).send(page('<p>Too many wrong keys. Try again later.</p>'));
+    res.status(429).send(page(notice('Too many wrong keys. Try again later.', false)));
+    return null;
   }
   if (!PAIR_KEY || req.body?.key !== PAIR_KEY) {
     recordFail(ip);
-    return res.status(403).send(page('<p>❌ Wrong pair key.</p><a href="/">Back</a>'));
+    res.status(403).send(page(notice('❌ Wrong pair key.')));
+    return null;
+  }
+
+  const number = String(req.body.number || '').replace(/\D/g, '');
+  if (!number) {
+    res.status(400).send(page(notice('Enter your number with country code.')));
+    return null;
   }
 
   if (pairBusy) {
-    return res
-      .status(429)
-      .send(page('<p>Another request is in progress. Wait a few seconds.</p><a href="/">Back</a>'));
+    res.status(429).send(page(notice('Another request is in progress. Wait a few seconds.')));
+    return null;
   }
 
+  return number;
+}
+
+// Starts a fresh socket for the number and waits until it is ready to link.
+// Returns the session, or null after sending a page.
+async function beginLink(res, number, viaQr) {
+  const existing = sessions.get(number);
+
+  if (existing?.isOnline) {
+    res.send(page(notice('✅ That number is already linked and online.')));
+    return null;
+  }
+  if (existing?.sock?.authState?.creds?.registered) {
+    res.send(page(notice('That number is already linked and is reconnecting. Give it a moment.')));
+    return null;
+  }
+  if (!existing && sessions.size >= MAX_SESSIONS) {
+    res.status(400).send(page(notice(`Limit of ${MAX_SESSIONS} numbers reached.`)));
+    return null;
+  }
+
+  const sess = await freshSession(number);
+  sess.viaQr = viaQr;
+
+  for (let i = 0; i < 40 && !sess.canPair; i++) await sleep(500);
+
+  if (!sess.canPair) {
+    res.status(503).send(page(notice('Not ready yet. Wait 10 seconds and try again.')));
+    return null;
+  }
+
+  sess.token = crypto.randomBytes(16).toString('hex'); // lets this page ask for status
+  return sess;
+}
+
+app.post('/pair', express.urlencoded({ extended: false }), async (req, res) => {
+  const number = checkRequest(req, res);
+  if (!number) return;
+
   pairBusy = true;
-
   try {
-    const number = String(req.body.number || '').replace(/\D/g, '');
-    if (!number) {
-      return res
-        .status(400)
-        .send(page('<p>Enter your number with country code.</p><a href="/">Back</a>'));
-    }
-
-    const existing = sessions.get(number);
-
-    if (existing?.isOnline) {
-      return res.send(page('<p>✅ That number is already linked and online.</p>'));
-    }
-    if (existing?.sock?.authState?.creds?.registered) {
-      return res.send(page('<p>That number is already linked and is reconnecting. Give it a moment.</p>'));
-    }
-    if (!existing && sessions.size >= MAX_SESSIONS) {
-      return res
-        .status(400)
-        .send(page(`<p>Limit of ${MAX_SESSIONS} numbers reached.</p><a href="/">Back</a>`));
-    }
-
-    const sess = await freshSession(number);
-
-    for (let i = 0; i < 40 && !sess.canPair; i++) await sleep(500);
-
-    if (!sess.canPair) {
-      return res
-        .status(503)
-        .send(page('<p>Not ready yet. Wait 10 seconds and try again.</p><a href="/">Back</a>'));
-    }
+    const sess = await beginLink(res, number, false);
+    if (!sess) return;
 
     const code = await sess.sock.requestPairingCode(number);
     const pretty = code.match(/.{1,4}/g)?.join('-') || code;
 
-    res.send(
-      page(`<p>Enter this code in WhatsApp now:</p>
-<div class="code">${esc(pretty)}</div>
-<button onclick="navigator.clipboard.writeText('${esc(code)}')">Copy code</button>
-<p id="t">Expires in about 90s</p>
-<p>WhatsApp may also show a notification. Tap it to open the code screen. Don't refresh this page, because that makes a new code and cancels this one.</p>
-<script>var s=90;setInterval(function(){s--;document.getElementById('t').textContent=s>0?('Expires in about '+s+'s'):'Expired. Go back and get a new code.';},1000);</script>`)
-    );
+    res.send(page(pairBody({ code: pretty, number, token: sess.token })));
   } catch (err) {
     console.error('Pair error:', err);
-    res
-      .status(500)
-      .send(page(`<p>Could not get a code: ${esc(err.message)}</p><a href="/">Back</a>`));
+    if (!res.headersSent) {
+      res.status(500).send(page(notice(`Could not get a code: ${esc(err.message)}`)));
+    }
   } finally {
     pairBusy = false;
   }
+});
+
+app.post('/qr', express.urlencoded({ extended: false }), async (req, res) => {
+  const number = checkRequest(req, res);
+  if (!number) return;
+
+  pairBusy = true;
+  try {
+    const sess = await beginLink(res, number, true);
+    if (!sess) return;
+
+    res.send(page(qrBody({ number, token: sess.token })));
+  } catch (err) {
+    console.error('QR error:', err);
+    if (!res.headersSent) {
+      res.status(500).send(page(notice(`Could not start: ${esc(err.message)}`)));
+    }
+  } finally {
+    pairBusy = false;
+  }
+});
+
+// The pair/QR page asks this every few seconds (needs the token it was given)
+app.get('/status', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const number = String(req.query.number || '').replace(/\D/g, '');
+  const sess = sessions.get(number);
+
+  if (!sess || !sess.token || req.query.token !== sess.token) {
+    return res.json({ state: 'ended' });
+  }
+  if (sess.isOnline) return res.json({ state: 'online' });
+  res.json({ state: 'waiting', qr: sess.viaQr ? sess.qr || null : null });
 });
 
 const PORT = process.env.PORT || 3000;
