@@ -15,6 +15,7 @@ import { attachFeatures } from './lib/features.js';
 import { useSupabaseAuthState } from './lib/supabaseAuth.js';
 import { followChannel } from './lib/channel.js';
 import { page as renderPage, notice, homeBody, pairBody, qrBody } from './lib/portal.js';
+import { loginPage, dashboardPage } from './lib/admin.js';
 
 // Works with both Baileys 6.x (CommonJS) and 7.x (ESM)
 const baileys =
@@ -198,6 +199,7 @@ async function startSession(id) {
       }
 
       sess.isOnline = true;
+      sess.onlineSince = Date.now();
       sess.canPair = false;
       console.log(`✅ [${id}] ${config.botName} is online!`);
       onConnected(s, config, id).catch((e) =>
@@ -209,6 +211,7 @@ async function startSession(id) {
 
     if (connection === 'close') {
       sess.isOnline = false;
+      sess.onlineSince = null;
       sess.canPair = false;
       sess.qr = null;
       onDisconnected(id);
@@ -492,6 +495,85 @@ app.get('/status', (req, res) => {
   }
   if (sess.isOnline) return res.json({ state: 'online' });
   res.json({ state: 'waiting', qr: sess.viaQr ? sess.qr || null : null });
+});
+
+// ---------- Admin dashboard (/admin) ----------
+// Protected by ADMIN_KEY. If you don't set one, PAIR_KEY is used instead.
+const ADMIN_KEY = process.env.ADMIN_KEY || process.env.PAIR_KEY;
+const adminToken = ADMIN_KEY
+  ? crypto.createHmac('sha256', ADMIN_KEY).update('admin-session').digest('hex')
+  : null;
+
+const sha = (v) => crypto.createHash('sha256').update(String(v)).digest();
+const safeEqual = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
+
+function cookieOf(req, name) {
+  for (const part of (req.headers.cookie || '').split(';')) {
+    const [k, ...v] = part.trim().split('=');
+    if (k === name) return decodeURIComponent(v.join('='));
+  }
+  return null;
+}
+
+const isAdmin = (req) => {
+  const c = cookieOf(req, 'admin');
+  return !!(adminToken && c && safeEqual(c, adminToken));
+};
+
+async function loadUsers() {
+  if (!supabase) return { enabled: false, total: 0, recent: [] };
+  const { data, count, error } = await supabase
+    .from('users')
+    .select('jid,name,last_seen', { count: 'exact' })
+    .order('last_seen', { ascending: false })
+    .limit(50);
+  if (error) return { enabled: true, error: error.message, total: 0, recent: [] };
+  return { enabled: true, total: count ?? data.length, recent: data };
+}
+
+app.get('/admin', (req, res) => {
+  if (!ADMIN_KEY) {
+    return res.status(503).send(loginPage(config.botName, 'Set ADMIN_KEY (or PAIR_KEY) to turn on the dashboard.'));
+  }
+  res.send(isAdmin(req) ? dashboardPage(config.botName) : loginPage(config.botName));
+});
+
+app.post('/admin/login', express.urlencoded({ extended: false }), (req, res) => {
+  if (!ADMIN_KEY) return res.status(503).send(loginPage(config.botName, 'Dashboard is not set up.'));
+  if (tooManyFails(req.ip)) {
+    return res.status(429).send(loginPage(config.botName, 'Too many wrong keys. Try again later.'));
+  }
+  if (!safeEqual(req.body?.key ?? '', ADMIN_KEY)) {
+    recordFail(req.ip);
+    return res.status(403).send(loginPage(config.botName, 'Wrong key.'));
+  }
+  res.setHeader(
+    'Set-Cookie',
+    `admin=${adminToken}; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=604800${req.secure ? '; Secure' : ''}`
+  );
+  res.redirect(303, '/admin');
+});
+
+app.post('/admin/logout', (req, res) => {
+  res.setHeader('Set-Cookie', 'admin=; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=0');
+  res.redirect(303, '/admin');
+});
+
+app.get('/admin/data', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!isAdmin(req)) return res.status(401).json({ error: 'login required' });
+
+  const list = [...sessions.values()]
+    .map((s) => ({
+      id: s.id,
+      name: s.sock?.user?.name || null,
+      online: !!s.isOnline,
+      linked: !!s.sock?.authState?.creds?.registered,
+      since: s.onlineSince || null,
+    }))
+    .sort((a, b) => Number(b.online) - Number(a.online) || a.id.localeCompare(b.id));
+
+  res.json({ now: Date.now(), sessions: list, users: await loadUsers() });
 });
 
 const PORT = process.env.PORT || 3000;
