@@ -42,6 +42,21 @@
       "value": "20",
       "required": false
     },
+    "SEND_PER_MINUTE": {
+      "description": "Most messages one number may send per minute. The bot waits when this is reached.",
+      "value": "20",
+      "required": false
+    },
+    "SEND_PER_HOUR": {
+      "description": "Most messages one number may send per hour. The bot refuses further sends until the hour passes.",
+      "value": "300",
+      "required": false
+    },
+    "SEND_PER_DAY": {
+      "description": "Most messages one number may send per day. Lower is safer for new numbers.",
+      "value": "1500",
+      "required": false
+    },
     "TIMEZONE": {
       "description": "Time zone used in the menu, for example Africa/Nairobi or UTC.",
       "value": "UTC",
