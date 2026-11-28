@@ -256,7 +256,13 @@ async function startSession(id) {
 
     for (const msg of messages) {
       try {
-        if (!msg.message) continue;
+        if (!msg.message) {
+          // Messages that could not be opened (for example some view once ones) arrive empty
+          if (msg.messageStubType) {
+            console.log(`[${id}] [msg] empty message from ${msg.key.remoteJid} (stub type ${msg.messageStubType}, ${type})`);
+          }
+          continue;
+        }
 
         const from = msg.key.remoteJid;
         if (!from || from === 'status@broadcast') continue;
@@ -276,6 +282,9 @@ async function startSession(id) {
         const body = getText(msg).trim();
         if (body) {
           console.log(`[${id}] [msg] ${msg.key.fromMe ? 'me' : 'them'} ${from}: ${body.slice(0, 60)}`);
+        } else {
+          // No text (photo, video, view once...): show what kind of message it is
+          console.log(`[${id}] [msg] ${msg.key.fromMe ? 'me' : 'them'} ${from}: <${Object.keys(msg.message).join(', ')}>`);
         }
 
         // "Owner" = the number this session is linked to (messages it sends itself)
