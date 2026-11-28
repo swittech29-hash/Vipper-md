@@ -1,6 +1,16 @@
 import * as baileysNs from '@whiskeysockets/baileys';
 import pino from 'pino';
-import { getViewOnce } from '../lib/features.js';
+
+// Loaded this way so the command still loads (and shows in the menu) even if
+// lib/features.js is an older version without the saved-copy helper.
+let getViewOnce = () => null;
+try {
+  const mod = await import('../lib/features.js');
+  if (typeof mod.getViewOnce === 'function') getViewOnce = mod.getViewOnce;
+  else console.error('[v1] lib/features.js is an old version: replace it with the latest one.');
+} catch (err) {
+  console.error('[v1] could not load lib/features.js:', err.message);
+}
 
 // Works with both Baileys 6.x (CommonJS) and 7.x (ESM)
 const b =
