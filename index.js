@@ -596,6 +596,46 @@ app.get('/admin/data', async (req, res) => {
   res.json({ now: Date.now(), sessions: list, users: await loadUsers() });
 });
 
+// Unlinks a number and removes it from the bot completely
+async function removeSession(sess) {
+  if (sess.timer) {
+    clearTimeout(sess.timer);
+    sess.timer = null;
+  }
+  sess.gen++; // anything the old socket still reports is ignored from now on
+  const wasOnline = sess.isOnline;
+  sess.isOnline = false;
+  sess.onlineSince = null;
+  sess.qr = null;
+  onDisconnected(sess.id); // stops the "still online" timer
+
+  // Ask WhatsApp to unlink the device (only possible while connected)
+  if (wasOnline) await sess.sock?.logout().catch(() => {});
+  try {
+    sess.sock?.end(undefined);
+  } catch {}
+
+  await wipeAuth(sess);
+  await Promise.resolve(resetWelcome(sess.id)).catch(() => {});
+  sessions.delete(sess.id);
+}
+
+app.post('/admin/disconnect', express.json({ limit: '1kb' }), async (req, res) => {
+  if (!isAdmin(req)) return res.status(401).json({ error: 'login required' });
+
+  const sess = sessions.get(String(req.body?.id || ''));
+  if (!sess) return res.status(404).json({ error: 'That number is not linked any more.' });
+
+  try {
+    await removeSession(sess);
+    console.log(`[${sess.id}] disconnected from the admin dashboard.`);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(`[${sess.id}] disconnect failed:`, err);
+    res.status(500).json({ error: 'Could not disconnect that number.' });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Web server on port ${PORT}`));
 
